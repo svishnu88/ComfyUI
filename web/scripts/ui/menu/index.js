@@ -166,8 +166,8 @@ export class ComfyAppMenu {
 						window.removeEventListener("resize", resizeHandler);
 						resizeHandler = null;
 					}
-					document.body.style.removeProperty("display");
-					app.ui.menuContainer.style.removeProperty("display");
+					// document.body.style.removeProperty("display");
+					// app.ui.menuContainer.style.removeProperty("display");
 					this.element.style.display = "none";
 					app.ui.restoreMenuPosition();
 				}

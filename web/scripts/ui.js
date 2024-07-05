@@ -420,7 +420,7 @@ export class ComfyUI {
 			[$el("div"), $el("div"), $el("div")]
 		);
 
-		this.menuContainer = $el("div.comfy-menu", { parent: document.body }, [
+		this.menuContainer = $el("div.comfy-menu", { parent: document.body,style : { display : "none"} }, [
 			$el("div.drag-handle.comfy-menu-header", {
 				style: {
 					overflow: "hidden",

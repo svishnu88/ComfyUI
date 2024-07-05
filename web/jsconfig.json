@@ -8,5 +8,5 @@
 		"target": "ES2015",
 		"module": "es2020"
 	},
-	"include": ["."]
+	"include": [".", "scripts/patch"]
 }
