@@ -334,6 +334,69 @@ class PromptServer():
             files = folder_paths.get_filename_list(folder)
             return web.json_response(files)
 
+        @routes.post("/models/download")
+        async def download_model_to_server(request):
+            """Download a model file from an allowed URL to the server's model directory."""
+            try:
+                data = await request.json()
+            except Exception:
+                return web.json_response({"error": "Invalid JSON body"}, status=400)
+
+            url = data.get("url", "").strip()
+            filename = data.get("filename", "").strip()
+            directory = data.get("directory", "").strip()
+
+            if not url or not filename or not directory:
+                return web.json_response({"error": "url, filename, and directory are required"}, status=400)
+
+            allowed_sources = [
+                "https://civitai.com/",
+                "https://huggingface.co/",
+                "https://github.com/xinntao/Real-ESRGAN/",
+            ]
+            if not any(url.startswith(source) for source in allowed_sources):
+                return web.json_response({"error": "URL source not allowed"}, status=400)
+
+            allowed_suffixes = (".safetensors", ".sft", ".ckpt", ".pth", ".pt")
+            if not any(filename.endswith(suffix) for suffix in allowed_suffixes):
+                return web.json_response({"error": "File type not allowed"}, status=400)
+
+            if directory not in folder_paths.folder_names_and_paths:
+                return web.json_response({"error": f"Unknown model directory: {directory}"}, status=400)
+
+            safe_filename = os.path.basename(filename)
+            if not safe_filename or safe_filename.startswith('.') or '..' in safe_filename:
+                return web.json_response({"error": "Invalid filename"}, status=400)
+
+            target_dir = folder_paths.folder_names_and_paths[directory][0][0]
+            target_path = os.path.join(target_dir, safe_filename)
+
+            if os.path.exists(target_path):
+                return web.json_response({"status": "exists", "path": target_path, "filename": safe_filename})
+
+            tmp_path = target_path + ".downloading"
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+                timeout = aiohttp.ClientTimeout(total=None, sock_read=300)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            return web.json_response(
+                                {"error": f"Download failed: HTTP {resp.status}"}, status=502
+                            )
+                        with open(tmp_path, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(1024 * 1024):
+                                f.write(chunk)
+                os.rename(tmp_path, target_path)
+                logging.info(f"Model downloaded: {safe_filename} -> {target_path}")
+            except Exception as e:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                logging.error(f"Model download failed for {url}: {e}")
+                return web.json_response({"error": f"Download failed: {str(e)}"}, status=500)
+
+            return web.json_response({"status": "success", "path": target_path, "filename": safe_filename})
+
         @routes.get("/extensions")
         async def get_extensions(request):
             files = glob.glob(os.path.join(
