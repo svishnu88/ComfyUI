@@ -384,10 +384,31 @@ class PromptServer():
                             return web.json_response(
                                 {"error": f"Download failed: HTTP {resp.status}"}, status=502
                             )
+                        total_size = int(resp.headers.get("content-length", 0))
+                        downloaded = 0
                         with open(tmp_path, "wb") as f:
                             async for chunk in resp.content.iter_chunked(1024 * 1024):
                                 f.write(chunk)
+                                downloaded += len(chunk)
+                                self.send_sync("model_download_progress", {
+                                    "url": url,
+                                    "filename": safe_filename,
+                                    "directory": directory,
+                                    "bytes_downloaded": downloaded,
+                                    "bytes_total": total_size,
+                                    "progress": round(downloaded / total_size * 100, 1) if total_size > 0 else 0,
+                                    "status": "downloading",
+                                })
                 os.rename(tmp_path, target_path)
+                self.send_sync("model_download_progress", {
+                    "url": url,
+                    "filename": safe_filename,
+                    "directory": directory,
+                    "bytes_downloaded": total_size,
+                    "bytes_total": total_size,
+                    "progress": 100,
+                    "status": "completed",
+                })
                 logging.info(f"Model downloaded: {safe_filename} -> {target_path}")
             except Exception as e:
                 if os.path.exists(tmp_path):
