@@ -376,6 +376,15 @@ class PromptServer():
 
             tmp_path = target_path + ".downloading"
 
+            # Prevent duplicate downloads of the same file
+            if not hasattr(self, '_active_downloads'):
+                self._active_downloads = set()
+
+            if safe_filename in self._active_downloads:
+                return web.json_response({"status": "already_downloading", "filename": safe_filename})
+
+            self._active_downloads.add(safe_filename)
+
             # Start the download in the background so we don't block the HTTP response.
             # The frontend tracks progress via WebSocket events.
             async def _do_download():
@@ -445,7 +454,13 @@ class PromptServer():
                             downloaded = os.path.getsize(tmp_path)
                         await asyncio.sleep(2 ** attempt)
 
-                os.rename(tmp_path, target_path)
+                # Another download may have completed this file while we were downloading
+                if os.path.exists(target_path):
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                elif os.path.exists(tmp_path):
+                    os.rename(tmp_path, target_path)
+
                 self.send_sync("model_download_progress", {
                     "url": url,
                     "filename": safe_filename,
@@ -474,6 +489,8 @@ class PromptServer():
                         "status": "error",
                         "error": str(e),
                     })
+                finally:
+                    self._active_downloads.discard(safe_filename)
 
             asyncio.ensure_future(_download_with_error_handling())
 
