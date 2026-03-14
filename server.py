@@ -413,20 +413,26 @@ class PromptServer():
 
                                 total_size = int(resp.headers.get("content-length", 0)) + downloaded
                                 mode = "ab" if resp.status == 206 else "wb"
+                                last_progress_time = 0
 
                                 with open(tmp_path, mode) as f:
                                     async for chunk in resp.content.iter_chunked(1024 * 1024):
                                         f.write(chunk)
                                         downloaded += len(chunk)
-                                        self.send_sync("model_download_progress", {
-                                            "url": url,
-                                            "filename": safe_filename,
-                                            "directory": directory,
-                                            "bytes_downloaded": downloaded,
-                                            "bytes_total": total_size,
-                                            "progress": round(downloaded / total_size * 100, 1) if total_size > 0 else 0,
-                                            "status": "downloading",
-                                        })
+
+                                        # Throttle progress updates to once per second
+                                        now = time.time()
+                                        if now - last_progress_time >= 1.0:
+                                            last_progress_time = now
+                                            self.send_sync("model_download_progress", {
+                                                "url": url,
+                                                "filename": safe_filename,
+                                                "directory": directory,
+                                                "bytes_downloaded": downloaded,
+                                                "bytes_total": total_size,
+                                                "progress": round(downloaded / total_size * 100, 1) if total_size > 0 else 0,
+                                                "status": "downloading",
+                                            })
                                 # Download completed successfully
                                 break
 
