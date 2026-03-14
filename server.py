@@ -375,48 +375,103 @@ class PromptServer():
                 return web.json_response({"status": "exists", "path": target_path, "filename": safe_filename})
 
             tmp_path = target_path + ".downloading"
-            try:
+
+            # Start the download in the background so we don't block the HTTP response.
+            # The frontend tracks progress via WebSocket events.
+            async def _do_download():
+                max_retries = 5
                 os.makedirs(target_dir, exist_ok=True)
-                timeout = aiohttp.ClientTimeout(total=None, sock_read=300)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url) as resp:
-                        if resp.status != 200:
-                            return web.json_response(
-                                {"error": f"Download failed: HTTP {resp.status}"}, status=502
-                            )
-                        total_size = int(resp.headers.get("content-length", 0))
-                        downloaded = 0
-                        with open(tmp_path, "wb") as f:
-                            async for chunk in resp.content.iter_chunked(1024 * 1024):
-                                f.write(chunk)
-                                downloaded += len(chunk)
-                                self.send_sync("model_download_progress", {
-                                    "url": url,
-                                    "filename": safe_filename,
-                                    "directory": directory,
-                                    "bytes_downloaded": downloaded,
-                                    "bytes_total": total_size,
-                                    "progress": round(downloaded / total_size * 100, 1) if total_size > 0 else 0,
-                                    "status": "downloading",
-                                })
+
+                # Check how much we already have from a previous partial download
+                downloaded = 0
+                if os.path.exists(tmp_path):
+                    downloaded = os.path.getsize(tmp_path)
+
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        timeout = aiohttp.ClientTimeout(total=None, sock_read=120)
+                        headers = {}
+                        if downloaded > 0:
+                            headers["Range"] = f"bytes={downloaded}-"
+                            logging.info(f"Resuming download of {safe_filename} from byte {downloaded}")
+
+                        async with aiohttp.ClientSession(timeout=timeout) as session:
+                            async with session.get(url, headers=headers) as resp:
+                                if resp.status == 416:
+                                    # Range not satisfiable — file is already complete
+                                    break
+
+                                if resp.status not in (200, 206):
+                                    if attempt == max_retries:
+                                        raise Exception(f"HTTP {resp.status}")
+                                    await asyncio.sleep(2 ** attempt)
+                                    continue
+
+                                # If server doesn't support Range, start from scratch
+                                if downloaded > 0 and resp.status == 200:
+                                    downloaded = 0
+
+                                total_size = int(resp.headers.get("content-length", 0)) + downloaded
+                                mode = "ab" if resp.status == 206 else "wb"
+
+                                with open(tmp_path, mode) as f:
+                                    async for chunk in resp.content.iter_chunked(1024 * 1024):
+                                        f.write(chunk)
+                                        downloaded += len(chunk)
+                                        self.send_sync("model_download_progress", {
+                                            "url": url,
+                                            "filename": safe_filename,
+                                            "directory": directory,
+                                            "bytes_downloaded": downloaded,
+                                            "bytes_total": total_size,
+                                            "progress": round(downloaded / total_size * 100, 1) if total_size > 0 else 0,
+                                            "status": "downloading",
+                                        })
+                                # Download completed successfully
+                                break
+
+                    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+                        logging.warning(f"Download attempt {attempt}/{max_retries} failed for {safe_filename}: {e}")
+                        if attempt == max_retries:
+                            raise
+                        # Update how much we have before retrying
+                        if os.path.exists(tmp_path):
+                            downloaded = os.path.getsize(tmp_path)
+                        await asyncio.sleep(2 ** attempt)
+
                 os.rename(tmp_path, target_path)
                 self.send_sync("model_download_progress", {
                     "url": url,
                     "filename": safe_filename,
                     "directory": directory,
-                    "bytes_downloaded": total_size,
-                    "bytes_total": total_size,
+                    "bytes_downloaded": downloaded,
+                    "bytes_total": downloaded,
                     "progress": 100,
                     "status": "completed",
                 })
                 logging.info(f"Model downloaded: {safe_filename} -> {target_path}")
-            except Exception as e:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-                logging.error(f"Model download failed for {url}: {e}")
-                return web.json_response({"error": f"Download failed: {str(e)}"}, status=500)
 
-            return web.json_response({"status": "success", "path": target_path, "filename": safe_filename})
+            async def _download_with_error_handling():
+                try:
+                    await _do_download()
+                except Exception as e:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                    logging.error(f"Model download failed for {safe_filename}: {e}")
+                    self.send_sync("model_download_progress", {
+                        "url": url,
+                        "filename": safe_filename,
+                        "directory": directory,
+                        "bytes_downloaded": 0,
+                        "bytes_total": 0,
+                        "progress": 0,
+                        "status": "error",
+                        "error": str(e),
+                    })
+
+            asyncio.ensure_future(_download_with_error_handling())
+
+            return web.json_response({"status": "started", "filename": safe_filename})
 
         @routes.get("/extensions")
         async def get_extensions(request):
