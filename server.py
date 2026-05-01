@@ -3,6 +3,7 @@ import sys
 import asyncio
 import traceback
 import time
+import glob
 
 import nodes
 import folder_paths
@@ -11,7 +12,6 @@ from comfy_execution.jobs import JobStatus, get_job, get_all_jobs
 import uuid
 import urllib
 import json
-import glob
 import struct
 import ssl
 import socket
@@ -25,6 +25,7 @@ from aiohttp import web
 import logging
 
 import mimetypes
+import re
 from comfy.cli_args import args
 import comfy.utils
 import comfy.model_management
@@ -67,6 +68,83 @@ async def send_socket_catch_exception(function, message):
 
 # Track deprecated paths that have been warned about to only warn once per file
 _deprecated_paths_warned = set()
+
+MODEL_DOWNLOAD_ALLOWED_SOURCES = (
+    "https://civitai.com/",
+    "https://civitai.red/",
+    "https://huggingface.co/",
+    "http://localhost:",
+)
+MODEL_DOWNLOAD_ALLOWED_FILENAMES = re.compile(
+    r"^[^/\\]+\.(safetensors|sft|ckpt|pth|pt)$", re.IGNORECASE
+)
+MODEL_DOWNLOAD_WHITELISTED_URLS = {
+    "https://huggingface.co/stabilityai/stable-zero123/resolve/main/stable_zero123.ckpt",
+    "https://huggingface.co/TencentARC/T2I-Adapter/resolve/main/models/t2iadapter_depth_sd14v1.pth?download=true",
+    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+}
+MODEL_DOWNLOAD_CONCURRENCY = 3
+MODEL_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MODEL_DOWNLOAD_CONCURRENCY)
+MODEL_DOWNLOAD_TASKS = {}
+
+
+def is_allowed_model_download_url(url: str) -> bool:
+    return url in MODEL_DOWNLOAD_WHITELISTED_URLS or any(
+        url.startswith(source) for source in MODEL_DOWNLOAD_ALLOWED_SOURCES
+    )
+
+
+def sanitize_model_download_filename(filename: str) -> str | None:
+    filename = os.path.basename(filename.strip())
+    if MODEL_DOWNLOAD_ALLOWED_FILENAMES.fullmatch(filename) is None:
+        return None
+    return filename
+
+
+async def download_model_file_to_path(client_session: aiohttp.ClientSession, task_id: str, url: str, destination: str, folder: str, filename: str) -> None:
+    temp_destination = f"{destination}.part-{task_id}"
+    try:
+        async with MODEL_DOWNLOAD_SEMAPHORE:
+            async with client_session.get(url, headers={"User-Agent": "ComfyUI"}) as response:
+                if response.status < 200 or response.status >= 300:
+                    raise RuntimeError(f"Download source returned HTTP {response.status}.")
+
+                total = int(response.headers.get("Content-Length") or 0)
+                MODEL_DOWNLOAD_TASKS[task_id].update({
+                    "status": "running",
+                    "bytes_total": total,
+                })
+
+                with open(temp_destination, "wb") as file:
+                    async for chunk in response.content.iter_chunked(1024 * 1024):
+                        file.write(chunk)
+                        MODEL_DOWNLOAD_TASKS[task_id]["bytes_downloaded"] += len(chunk)
+                        if total > 0:
+                            MODEL_DOWNLOAD_TASKS[task_id]["progress"] = min(
+                                1.0,
+                                MODEL_DOWNLOAD_TASKS[task_id]["bytes_downloaded"] / total,
+                            )
+
+        os.replace(temp_destination, destination)
+        folder_paths.filename_list_cache.pop(folder, None)
+        MODEL_DOWNLOAD_TASKS[task_id].update({
+            "status": "completed",
+            "bytes_downloaded": os.path.getsize(destination),
+            "bytes_total": os.path.getsize(destination),
+            "progress": 1.0,
+        })
+        logging.info("Downloaded model %s to %s", url, destination)
+    except Exception as error:
+        if os.path.exists(temp_destination):
+            try:
+                os.remove(temp_destination)
+            except OSError:
+                pass
+        MODEL_DOWNLOAD_TASKS[task_id].update({
+            "status": "failed",
+            "error": str(error),
+        })
+        logging.exception("Failed to download model %s to %s", url, destination)
 
 @web.middleware
 async def deprecation_warning(request: web.Request, handler):
@@ -339,6 +417,94 @@ class PromptServer():
                 return web.Response(status=404)
             files = folder_paths.get_filename_list(folder)
             return web.json_response(files)
+
+        @routes.post("/jarvis/models/download")
+        async def download_model_to_server(request):
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response({"error": "Request body must be JSON."}, status=400)
+
+            url = str(body.get("url", "")).strip()
+            folder = str(body.get("directory", "")).strip()
+            filename = sanitize_model_download_filename(str(body.get("filename", "")))
+
+            if not url or not is_allowed_model_download_url(url):
+                return web.json_response({"error": "Unsupported model download URL."}, status=400)
+            if folder not in folder_paths.folder_names_and_paths:
+                return web.json_response({"error": "Unknown model directory."}, status=400)
+            if filename is None:
+                return web.json_response({"error": "Unsupported model filename."}, status=400)
+
+            model_paths = folder_paths.get_folder_paths(folder)
+            if not model_paths:
+                return web.json_response({"error": "No path is configured for this model directory."}, status=400)
+
+            destination_dir = model_paths[0]
+            os.makedirs(destination_dir, exist_ok=True)
+            destination = os.path.abspath(os.path.join(destination_dir, filename))
+            root = os.path.abspath(destination_dir)
+            if os.path.commonpath([root, destination]) != root:
+                return web.json_response({"error": "Invalid model filename."}, status=400)
+
+            if os.path.exists(destination):
+                return web.json_response({
+                    "status": "exists",
+                    "task_id": None,
+                    "filename": filename,
+                    "path": destination,
+                    "directory": folder,
+                    "bytes_downloaded": os.path.getsize(destination),
+                    "bytes_total": os.path.getsize(destination),
+                    "progress": 1.0,
+                })
+
+            existing_task = next(
+                (
+                    task
+                    for task in MODEL_DOWNLOAD_TASKS.values()
+                    if task.get("path") == destination
+                    and task.get("status") in {"created", "running"}
+                ),
+                None,
+            )
+            if existing_task is not None:
+                return web.json_response(existing_task, status=202)
+
+            for partial_path in glob.glob(f"{destination}.part-*"):
+                try:
+                    os.remove(partial_path)
+                except OSError:
+                    logging.warning("Failed to remove stale partial model download %s", partial_path)
+
+            task_id = uuid.uuid4().hex
+            MODEL_DOWNLOAD_TASKS[task_id] = {
+                "task_id": task_id,
+                "status": "created",
+                "filename": filename,
+                "path": destination,
+                "directory": folder,
+                "bytes_downloaded": 0,
+                "bytes_total": 0,
+                "progress": 0.0,
+                "error": None,
+            }
+            asyncio.create_task(download_model_file_to_path(self.client_session, task_id, url, destination, folder, filename))
+            return web.json_response({
+                "status": "started",
+                "task_id": task_id,
+                "filename": filename,
+                "path": destination,
+                "directory": folder,
+            }, status=202)
+
+        @routes.get("/jarvis/models/download/{task_id}")
+        async def get_model_download_status(request):
+            task_id = request.match_info.get("task_id", "")
+            task = MODEL_DOWNLOAD_TASKS.get(task_id)
+            if task is None:
+                return web.json_response({"error": "Unknown model download task."}, status=404)
+            return web.json_response(task)
 
         @routes.get("/extensions")
         async def get_extensions(request):
