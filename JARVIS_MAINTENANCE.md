@@ -55,6 +55,9 @@ Jarvis and upstream intentionally agree to share the behavior.
 
 ## Deploying To Jarvis Labs
 
+For a fresh PyTorch container setup, use the tested runbook in
+`JARVIS_PYTORCH_CONTAINER_SETUP.md`.
+
 Upload the changed backend files to the GPU instance, then restart ComfyUI:
 
 ```bash
